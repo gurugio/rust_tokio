@@ -11,9 +11,9 @@ fn print_type_of<T>(_: &T) {
 }
 
 fn main() {
-    // txtInotifyWatcher::new() returns future instance because it is "async fn".
-    let iwatcher = TxtInotifyWatcher::new();
-    print_type_of(&iwatcher);
+    // get a future instance because it is "async fn".
+    let iwatcher = newwatcher();
+    print_type_of(&iwatcher); // check the exact type name
 
     // create a runtime of tokio
     // that runs the async function.
@@ -26,75 +26,84 @@ fn main() {
     let _ = rt.block_on(iwatcher);
 }
 
-pub struct TxtInotifyWatcher {}
+async fn newwatcher() -> Result<()> {
+    // just an internal buffer for Inotify stream
+    let buf: Vec<u8> = vec![0; 64];
+    // PathBuf instance for the current directory
+    let path: PathBuf = std::env::current_dir()?.into();
+    // Box::pin is mandatory for .next() method
+    // because .next() requires unpin.
+    let new_files = Box::pin(InotifyTxtStream::new(buf, path.to_owned()).unwrap());
 
-impl TxtInotifyWatcher {
-    async fn new() -> Result<()> {
-        let buf: Vec<u8> = vec![0; 64];
-        let path: PathBuf = std::env::current_dir()?.into();
-        let watcher = Box::pin(InotifyQmpStream::new(buf, path.to_owned()).unwrap());
-
-        let existing_sockets = FsQmpStream::new(path.to_owned()).unwrap();
-        let mut qmp_sockets = existing_sockets.chain(watcher);
-        while let Some(qmp) = qmp_sockets.next().await {
-            println!("{:?}", qmp);
-        }
-        Ok(())
+    // add inotify for existing txt files
+    let existing_files = FsTxtStream::new(path.to_owned()).unwrap();
+    let mut txt_files = existing_files.chain(new_files);
+    while let Some(name) = txt_files.next().await {
+        println!("{:?}", name);
     }
+    Ok(())
 }
 
-struct InotifyQmpStream {}
+struct InotifyTxtStream {}
 
-impl InotifyQmpStream {
-    async fn socket_path((ev, dir_path): (Event<std::ffi::OsString>, PathBuf)) -> Option<PathBuf> {
+impl InotifyTxtStream {
+    async fn txt_path((ev, dir_path): (Event<std::ffi::OsString>, PathBuf)) -> Option<PathBuf> {
         match ev.mask {
             EventMask::CREATE => {
                 let path = dir_path.join(ev.name?);
-                let is_socket = path.extension()? == "txt";
-                is_socket.as_some(path)
+                let is_txt = path.extension()? == "txt";
+                is_txt.as_some(path)
             }
             _ => None,
         }
     }
-    pub fn new<T>(buffer: T, qmp_socket_path: PathBuf) -> Result<impl Stream<Item = PathBuf>>
-    where
-        T: AsMut<[u8]> + AsRef<[u8]>,
-    {
+    /// return an inotify instance streaming target path
+    pub fn new(buffer: Vec<u8>, target_path: PathBuf) -> Result<impl Stream<Item = PathBuf>> {
+        // make a inotify instance watching create event
         let mut inotify = Inotify::init()?;
         inotify
-            .add_watch(&qmp_socket_path, WatchMask::CREATE)
+            .add_watch(&target_path, WatchMask::CREATE)
             .with_context(|| {
                 format!(
-                    "Failed to open qmp socket directory directory {}\nCheck the `qmp_socket_directory` configuration variable",
-                    qmp_socket_path.display()
+                    "Failed to open target directory {}\n",
+                    target_path.display()
                 )
             })?;
 
+        // event-stream: multi-event
+        // take_while: take event only ready -> why?
+        // map: create a pair (event, path)
+        // filter_map: filtering only path has txt extension
         let inotify_stream = inotify
             .event_stream(buffer)?
             .take_while(|ev| future::ready(ev.is_ok()))
-            .map(move |ev| (ev.unwrap(), qmp_socket_path.clone()))
-            .filter_map(InotifyQmpStream::socket_path);
+            .map(move |ev| (ev.unwrap(), target_path.clone()))
+            .filter_map(InotifyTxtStream::txt_path);
 
+        // return a stream that return PathBuf including txt
         Ok(inotify_stream)
     }
 }
 
-struct FsQmpStream {}
+struct FsTxtStream {}
 
-impl FsQmpStream {
-    fn socket_path(dir_entry: std::fs::DirEntry) -> Option<PathBuf> {
+impl FsTxtStream {
+    fn txt_path(dir_entry: std::fs::DirEntry) -> Option<PathBuf> {
         let file_type = dir_entry.file_type().ok()?;
-        let is_socket = file_type.is_file() && !file_type.is_dir();
-        is_socket.as_some(dir_entry.path())
+        let is_txt =
+            file_type.is_file() && !file_type.is_dir() && dir_entry.path().extension()? == "txt";
+        is_txt.as_some(dir_entry.path())
     }
 
-    pub fn new(qmp_socket_path: PathBuf) -> Result<impl Stream<Item = PathBuf>> {
-        let fs_qmp_stream = futures::stream::iter(
-            std::fs::read_dir(qmp_socket_path)?
+    pub fn new(target_path: PathBuf) -> Result<impl Stream<Item = PathBuf>> {
+        // futures::stream::iter: convert iterator to stream
+        // read_dir: iterator to read target path
+        let fs_txt_stream = futures::stream::iter(
+            std::fs::read_dir(target_path)?
                 .flatten()
-                .filter_map(FsQmpStream::socket_path),
+                .filter_map(FsTxtStream::txt_path),
         );
-        Ok(fs_qmp_stream)
+        // return a stream that return PathBuf including txt
+        Ok(fs_txt_stream)
     }
 }
